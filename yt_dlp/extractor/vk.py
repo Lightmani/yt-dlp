@@ -1,6 +1,7 @@
 import collections
 import hashlib
 import re
+import time
 import urllib.parse
 
 from .common import InfoExtractor
@@ -10,6 +11,7 @@ from .sibnet import SibnetEmbedIE
 from .vimeo import VimeoIE
 from .youtube import YoutubeIE
 from ..jsinterp import JSInterpreter
+from ..networking.exceptions import HTTPError
 from ..utils import (
     ExtractorError,
     UserNotLive,
@@ -18,8 +20,10 @@ from ..utils import (
     get_element_html_by_id,
     int_or_none,
     join_nonempty,
+    jwt_decode_hs256,
     parse_qs,
     parse_resolution,
+    remove_start,
     str_or_none,
     str_to_int,
     try_call,
@@ -35,6 +39,12 @@ from ..utils.traversal import require, traverse_obj
 
 class VKBaseIE(InfoExtractor):
     _NETRC_MACHINE = 'vk'
+    _API_CLIENT_ID = 52461373
+    _API_VERSION = '5.282'
+    _GUEST_TOKEN_CACHE_KEY = 'guest_token'
+    _guest_token = None
+    # None: not fetched yet; False: unavailable (not logged in / invalid cookies)
+    _user_token = None
 
     def _download_webpage_handle(self, url_or_request, video_id, *args, fatal=True, **kwargs):
         response = super()._download_webpage_handle(url_or_request, video_id, *args, fatal=fatal, **kwargs)
@@ -96,8 +106,9 @@ class VKBaseIE(InfoExtractor):
             raise ExtractorError(
                 'Unable to login, incorrect username and/or password', expected=True)
 
-    def _download_payload(self, path, video_id, data, fatal=True):
-        endpoint = f'https://vk.com/{path}.php'
+    def _download_payload(self, path, video_id, data, fatal=True, host='vkvideo.ru'):
+        # vk.com redirects video requests to the login page even with valid vkvideo.ru cookies
+        endpoint = f'https://{host}/{path}.php'
         data['al'] = 1
         code, payload = self._download_json(
             endpoint, video_id, data=urlencode_postdata(data), fatal=fatal,
@@ -110,6 +121,90 @@ class VKBaseIE(InfoExtractor):
         elif code == '8':
             raise ExtractorError(clean_html(payload[0][1:-1]), expected=True)
         return payload
+
+    @property
+    def _is_logged_in(self):
+        return bool(self._get_cookies('https://vkvideo.ru').get('remixdsid'))
+
+    @staticmethod
+    def _is_token_expired(token):
+        exp = try_call(lambda: float(jwt_decode_hs256(remove_start(token, 'anonym.'))['exp']))
+        return exp is None or exp - time.time() < 300
+
+    def _fetch_user_token(self):
+        response = self._download_webpage_handle(
+            'https://vkvideo.ru/al_video.php', None, 'Fetching user access token',
+            'Unable to fetch user access token', fatal=False, query={'act': 'web_token'},
+            data=urlencode_postdata({'version': 1, 'app_id': self._API_CLIENT_ID}),
+            headers={'Accept': '*/*', 'Content-Type': 'application/x-www-form-urlencoded'})
+        if response is False:
+            return None
+
+        webpage, urlh = response
+        result = {}
+        if not urllib.parse.urlparse(urlh.url).netloc.startswith('login.'):
+            result = traverse_obj(self._parse_json(webpage, None, fatal=False), (0, {dict})) or {}
+        token = traverse_obj(result, ('access_token', {str}))
+        if not token:
+            self.report_warning(join_nonempty(
+                'Unable to fetch user access token',
+                traverse_obj(result, ('error_text', {str}, {lambda x: f'({x})'})),
+                '- your vkvideo.ru cookies may be invalid or expired. Falling back to guest access', delim=' '))
+        return token
+
+    def _get_guest_token(self, refresh=False):
+        if not refresh:
+            token = self._guest_token or self.cache.load(self._NETRC_MACHINE, self._GUEST_TOKEN_CACHE_KEY)
+            if token and not self._is_token_expired(token):
+                self._guest_token = token
+                return token
+
+        try:
+            response = self._download_json(
+                'https://login.vk.com/', None, 'Fetching guest access token', query={
+                    'act': 'get_anonym_token',
+                    'client_secret': 'o557NLIkAErNhakXrQ7A',
+                    'client_id': self._API_CLIENT_ID,
+                    'scopes': 'audio_anonymous,video_anonymous,photos_anonymous,profile_anonymous',
+                })
+        except ExtractorError as e:
+            if isinstance(e.cause, HTTPError):
+                error = traverse_obj(self._parse_json(
+                    e.cause.response.read().decode(), None, fatal=False), ('error_description', {str}))
+                if error:
+                    raise ExtractorError(f'Unable to fetch guest access token: {error}', expected=True)
+            raise
+
+        self._guest_token = traverse_obj(response, ('data', 'access_token', {str}, {require('guest access token')}))
+        self.cache.store(self._NETRC_MACHINE, self._GUEST_TOKEN_CACHE_KEY, self._guest_token)
+        return self._guest_token
+
+    def _get_api_token(self, refresh=False):
+        if self._user_token is not False and self._is_logged_in:
+            if refresh or not self._user_token:
+                self._user_token = self._fetch_user_token() or False
+            if self._user_token:
+                return self._user_token
+        return self._get_guest_token(refresh)
+
+    def _call_api(self, method, video_id, data=None, note='Downloading API JSON'):
+        for is_retry in (False, True):
+            response = self._download_json(
+                f'https://api.vk.com/method/{method}', video_id, note,
+                query={'v': self._API_VERSION, 'client_id': self._API_CLIENT_ID},
+                data=urlencode_postdata({**(data or {}), 'access_token': self._get_api_token(refresh=is_retry)}),
+                headers={'Accept': '*/*', 'Content-Type': 'application/x-www-form-urlencoded'})
+
+            error = traverse_obj(response, ('error', {dict}))
+            if not error:
+                return traverse_obj(response, ('response', {require('API response')}))
+
+            code = error.get('error_code')
+            message = error.get('error_msg') or 'Unknown error'
+            # 5: User authorization failed (e.g. expired token) - refresh the token and retry once
+            if not is_retry and (code == 5 or 'authorization failed' in message.lower()):
+                continue
+            raise ExtractorError(f'VK API error {code}: {message}', expected=True)
 
 
 class VKIE(VKBaseIE):
@@ -342,6 +437,25 @@ class VKIE(VKBaseIE):
             },
         },
         {
+            # al_video.php falsely reported "Video only available to followers"
+            'url': 'https://vkvideo.ru/video-240471631_456239017',
+            'info_dict': {
+                'id': '-240471631_456239017',
+                'ext': 'mp4',
+                'title': 'A Quiet Day： Fishing and Cooking With Mama Cat 🐱🌿',
+                'description': 'This is Funny Cat Video',
+                'uploader_id': '-240471631',
+                'comment_count': int,
+                'like_count': int,
+                'repost_count': int,
+                'view_count': int,
+                'duration': 71,
+                'timestamp': 1784985562,
+                'upload_date': '20260725',
+                'thumbnail': r're:https?://.+getVideoPreview.+',
+            },
+        },
+        {
             # live stream, hls and rtmp links, most likely already finished live
             # stream by the time you are reading this comment
             'url': 'https://vk.com/video-140332_456239111',
@@ -394,21 +508,42 @@ class VKIE(VKBaseIE):
         video_id = mobj.group('videoid')
 
         mv_data = {}
+        info_page = ''
         if video_id:
-            data = {
-                'act': 'show',
-                'video': video_id,
-            }
-            # Some videos (removed?) can only be downloaded with list id specified
+            # The al_video.php 'show' payload falsely reports "Video only available to followers"
+            # for many videos, so use the official API instead (user token if logged in, else guest token)
+            video_keys = [video_id]
+            # A hex `list` value is the access key required for private/unlisted videos
             list_id = mobj.group('list_id')
-            if list_id:
-                data['list'] = list_id
+            if list_id and re.fullmatch(r'[\da-f]+', list_id):
+                video_keys.insert(0, f'{video_id}_{list_id}')
 
-            payload = self._download_payload('al_video', video_id, data)
-            info_page = payload[1]
-            opts = payload[-1]
-            mv_data = opts.get('mvData') or {}
-            player = opts.get('player') or {}
+            for video_key in video_keys:
+                mv_data = traverse_obj(self._call_api('video.getByIds', video_id, data={
+                    'videos': video_key,
+                    'video_fields': 'added,episodes,files,image,is_favorite,subtitles,timeline_thumbs,trailer,volume_multiplier',
+                }), ('items', 0, {dict}))
+                if mv_data:
+                    break
+            else:
+                if not self._is_logged_in:
+                    self.raise_login_required(f'Video {video_id} is not available', method='cookies')
+                raise ExtractorError(f'Video {video_id} is not available', expected=True)
+
+            data = mv_data
+            # Videos hosted elsewhere (YouTube etc.) only have an external link or embed player URL
+            external_url = traverse_obj(data, ('files', 'external', {url_or_none}))
+            if not external_url and not traverse_obj(data, ('files', {dict})):
+                external_url = traverse_obj(data, ('player', {url_or_none}, filter, {lambda x: None if re.match(
+                    r'https?://(?:[^/]+\.)?vk(?:video)?\.(?:com|ru)/', x) else x}))
+            if external_url:
+                return self.url_result(external_url)
+            if not traverse_obj(data, ('files', {dict})):
+                restricted_msg = traverse_obj(data, ('content_restricted_message', {clean_html}, filter))
+                if restricted_msg:
+                    if not self._is_logged_in:
+                        self.raise_login_required(restricted_msg, method='cookies')
+                    raise ExtractorError(restricted_msg, expected=True)
         else:
             video_id = '{}_{}'.format(mobj.group('oid'), mobj.group('id'))
 
@@ -506,11 +641,16 @@ class VKIE(VKBaseIE):
                     opts_url = 'https:' + opts_url
                 return self.url_result(opts_url)
 
-        data = player['params'][0]
+        if mv_data:
+            # API video object: format URLs are under 'files' (mp4_<height>, hls, dash_sep, ...)
+            format_urls = traverse_obj(data, ('files', {dict})) or {}
+        else:
+            # embed player params: format URLs are top-level keys (url<height>, hls, dash_sep, ...)
+            data = player['params'][0]
+            format_urls = data
 
-        # 2 = live
-        # 3 = post live (finished live)
-        is_live = data.get('live') == 2
+        # player params 'live': 2 = live, 3 = post live (finished live)
+        is_live = data.get('live') == 2 or data.get('live_status') == 'started'
 
         timestamp = unified_timestamp(self._html_search_regex(
             r'class=["\']mv_info_date[^>]+>([^<]+)(?:<|from)', info_page,
@@ -518,18 +658,18 @@ class VKIE(VKBaseIE):
 
         view_count = str_to_int(self._search_regex(
             r'class=["\']mv_views_count[^>]+>\s*([\d,.]+)',
-            info_page, 'view count', default=None))
+            info_page, 'view count', default=None)) or int_or_none(data.get('views'))
 
         formats = []
         subtitles = {}
-        for format_id, format_url in data.items():
+        for format_id, format_url in format_urls.items():
             format_url = url_or_none(format_url)
             if not format_url or not format_url.startswith(('http', '//', 'rtmp')):
                 continue
-            if (format_id.startswith(('url', 'cache'))
+            if (format_id.startswith(('url', 'cache', 'mp4_'))
                     or format_id in ('extra_data', 'live_mp4', 'postlive_mp4')):
                 height = int_or_none(self._search_regex(
-                    r'^(?:url|cache)(\d+)', format_id, 'height', default=None))
+                    r'^(?:url|cache|mp4_)(\d+)', format_id, 'height', default=None))
                 formats.append({
                     'format_id': format_id,
                     'url': format_url,
@@ -555,34 +695,54 @@ class VKIE(VKBaseIE):
                     'ext': 'flv',
                 })
 
-        for sub in data.get('subs') or {}:
-            subtitles.setdefault(sub.get('lang', 'en'), []).append({
-                'ext': sub.get('title', '.srt').split('.')[-1],
-                'url': url_or_none(sub.get('url')),
-            })
+        automatic_captions = {}
+        for sub in traverse_obj(data, (('subs', 'subtitles'), lambda _, v: url_or_none(v['url']))):
+            sub_info = {
+                'url': sub['url'],
+                # API subtitles are always WebVTT, per https://st.vkvideo.ru/dist/web/chunks/83757e58.18a7cf4a.js
+                'ext': 'vtt' if mv_data else sub.get('title', '.srt').split('.')[-1],
+            }
+            lang = sub.get('lang') or 'en'
+            if sub.get('is_auto'):
+                sub_info['name'] = sub.get('title') or 'Automatic captions'
+                automatic_captions.setdefault(lang, []).append(sub_info)
+            else:
+                subtitles.setdefault(lang, []).append(sub_info)
+
+        thumbnails = traverse_obj(data, (
+            ('short_video_cover', 'jpg'), {url_or_none}, filter, {lambda x: {'url': x}}))
+        if not thumbnails:
+            thumbnails = traverse_obj(data, ('image', lambda _, v: url_or_none(v['url']), {
+                'url': 'url',
+                'width': ('width', {int_or_none}),
+                'height': ('height', {int_or_none}),
+            }))
 
         return {
             'id': video_id,
             'formats': formats,
             'subtitles': subtitles,
-            **traverse_obj(mv_data, {
-                'title': ('title', {str}, {unescapeHTML}),
-                'description': ('desc', {clean_html}, filter),
-                'duration': ('duration', {int_or_none}),
-                'like_count': ('likes', {int_or_none}),
-                'comment_count': ('commcount', {int_or_none}),
-            }),
+            'automatic_captions': automatic_captions,
+            'thumbnails': thumbnails,
             **traverse_obj(data, {
                 'title': ('md_title', {str}, {unescapeHTML}),
                 'description': ('description', {clean_html}, filter),
-                'thumbnail': ('jpg', {url_or_none}),
                 'uploader': ('md_author', {str}, {unescapeHTML}),
-                'uploader_id': (('author_id', 'authorId'), {str_or_none}, any),
+                'uploader_id': (('author_id', 'authorId', 'owner_id'), {str_or_none}, any),
                 'duration': ('duration', {int_or_none}),
                 'chapters': ('time_codes', lambda _, v: isinstance(v['time'], int), {
                     'title': ('text', {str}, {unescapeHTML}),
                     'start_time': 'time',
                 }),
+            }),
+            # API video object; takes priority to keep line breaks in the plain-text description
+            **traverse_obj(mv_data, {
+                'title': ('title', {str}, {unescapeHTML}),
+                'description': ('description', {str}, {unescapeHTML}, {str.strip}, filter),
+                'duration': ('duration', {int_or_none}),
+                'like_count': ('likes', 'count', {int_or_none}),
+                'repost_count': ('reposts', 'count', {int_or_none}),
+                'comment_count': ('comments', {int_or_none}),
             }),
             'timestamp': timestamp,
             'view_count': view_count,
@@ -776,7 +936,7 @@ class VKWallPostIE(VKBaseIE):
         webpage = self._download_payload('wkview', post_id, {
             'act': 'show',
             'w': 'wall' + post_id,
-        })[1]
+        }, host='vk.com')[1]
 
         uploader = clean_html(get_element_by_class('PostHeaderTitle__authorName', webpage))
 
